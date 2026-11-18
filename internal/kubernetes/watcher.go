@@ -185,27 +185,7 @@ func (m *Manager) handlePodEvent(eventType string, obj interface{}) {
 }
 
 func (m *Manager) toPodEvent(eventType string, pod *corev1.Pod) restate.PodEvent {
-	reason := ""
-	message := ""
-	containerName := ""
-
-	for _, cs := range pod.Status.ContainerStatuses {
-		if cs.State.Waiting != nil {
-			reason = cs.State.Waiting.Reason
-			message = cs.State.Waiting.Message
-			containerName = cs.Name
-			break
-		}
-		if cs.State.Terminated != nil {
-			reason = cs.State.Terminated.Reason
-			message = cs.State.Terminated.Message
-			containerName = cs.Name
-			if reason == reasonCompleted {
-				continue
-			}
-			break
-		}
-	}
+	reason, message, containerName := podIncident(pod, time.Now())
 
 	restartCount := int32(0)
 	for _, cs := range pod.Status.ContainerStatuses {
@@ -223,4 +203,48 @@ func (m *Manager) toPodEvent(eventType string, pod *corev1.Pod) restate.PodEvent
 		ContainerName: containerName,
 		Labels:        pod.Labels,
 	}
+}
+
+// podIncident : raison la plus utile d'un pod, dans cet ordre :
+//  1. expulsion (raison portée par le pod, pas par ses conteneurs) ;
+//  2. conteneur en attente (CrashLoopBackOff, ImagePullBackOff…) ; en
+//     CrashLoopBackOff, OOMKilled l'emporte si c'est la cause du dernier arrêt ;
+//  3. conteneur arrêté en erreur ;
+//  4. conteneur redémarré depuis peu après un OOMKilled (l'état courant est
+//     Running et ne dit plus rien).
+//
+// Le cas 4 n'est retenu que dans la fenêtre lastTerminationFresh : au-delà,
+// une resynchronisation de l'informer renverrait un incident clos et
+// remettrait le conteneur en OOM_KILLED après son retour à RUNNING.
+func podIncident(pod *corev1.Pod, now time.Time) (reason, message, container string) {
+	if pod.Status.Reason == reasonEvicted {
+		return reasonEvicted, pod.Status.Message, ""
+	}
+	statuses := make([]corev1.ContainerStatus, 0, len(pod.Status.InitContainerStatuses)+len(pod.Status.ContainerStatuses))
+	statuses = append(statuses, pod.Status.InitContainerStatuses...)
+	statuses = append(statuses, pod.Status.ContainerStatuses...)
+
+	for _, cs := range statuses {
+		if w := cs.State.Waiting; w != nil && w.Reason != "" {
+			if w.Reason == reasonCrashLoopBackOff {
+				if last := cs.LastTerminationState.Terminated; last != nil && last.Reason == reasonOOMKilled {
+					return reasonOOMKilled, w.Message, cs.Name
+				}
+			}
+			return w.Reason, w.Message, cs.Name
+		}
+	}
+	for _, cs := range statuses {
+		if t := cs.State.Terminated; t != nil && t.Reason != reasonCompleted {
+			return t.Reason, t.Message, cs.Name
+		}
+	}
+	for _, cs := range statuses {
+		last := cs.LastTerminationState.Terminated
+		if cs.State.Running != nil && last != nil && last.Reason == reasonOOMKilled &&
+			now.Sub(last.FinishedAt.Time) <= lastTerminationFresh {
+			return reasonOOMKilled, last.Message, cs.Name
+		}
+	}
+	return "", "", ""
 }

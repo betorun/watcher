@@ -41,6 +41,9 @@ const (
 	// defaultDedupCooldown : fenêtre de déduplication d'un même événement.
 	defaultDedupCooldown = 3 * time.Minute
 	cleanupInterval      = 10 * time.Minute
+	// lastTerminationFresh : âge maximal d'un arrêt passé (LastTerminationState)
+	// encore signalé ; nettement plus court que informerResync.
+	lastTerminationFresh = 2 * time.Minute
 )
 
 // Informers et découverte des espaces de noms.
