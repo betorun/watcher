@@ -13,6 +13,7 @@ import (
 	"github.com/sony/gobreaker"
 	"go.uber.org/zap"
 
+	"github.com/thekrauss/watcher/internal/auth"
 	"github.com/thekrauss/watcher/internal/metrics"
 )
 
@@ -21,12 +22,15 @@ type IRestateClient interface {
 	Enroll(ctx context.Context) error
 	GetRemoteConfig(ctx context.Context) (*RemoteConfig, error)
 	NotifyPodEvent(ctx context.Context, event PodEvent) error
-	NotifyPodEvents(ctx context.Context, events []PodEvent) error
+	// ReportServiceAccountKeys : publie l'émetteur et le JWKS des jetons de
+	// comptes Kubernetes du cluster (identité des workloads betorun).
+	ReportServiceAccountKeys(ctx context.Context, issuer string, jwks json.RawMessage) error
 }
 
 type RestateClient struct {
 	url       string
 	clusterID string
+	auth      auth.Authenticator // fichier de clé (jeton STS) ou clé API
 	http      *http.Client
 	log       *zap.SugaredLogger
 	cb        *gobreaker.CircuitBreaker
@@ -63,14 +67,19 @@ type remoteConfigResponse struct {
 	EnabledReasons       []string `json:"enabled_reasons"`
 }
 
-func NewRestateClient(baseURL, clusterID string, timeout time.Duration, log *zap.SugaredLogger) *RestateClient {
+// NewRestateClient construit un client Restate-compatible ; a pose
+// l'authentification de chaque requête (auth.None en dev local).
+func NewRestateClient(baseURL, clusterID string, a auth.Authenticator, timeout time.Duration, log *zap.SugaredLogger) *RestateClient {
+	if a == nil {
+		a = auth.None{}
+	}
 	cb := gobreaker.NewCircuitBreaker(gobreaker.Settings{
-		Name:        "restate-client",
-		MaxRequests: 5,
-		Interval:    10 * time.Second,
-		Timeout:     30 * time.Second,
+		Name:        breakerName,
+		MaxRequests: breakerMaxRequests,
+		Interval:    breakerInterval,
+		Timeout:     breakerOpenTimeout,
 		ReadyToTrip: func(counts gobreaker.Counts) bool {
-			return counts.ConsecutiveFailures >= 5
+			return counts.ConsecutiveFailures >= breakerTripAfter
 		},
 		OnStateChange: func(name string, from gobreaker.State, to gobreaker.State) {
 			log.Warnw("Circuit Breaker state changed", "name", name, "from", from.String(), "to", to.String())
@@ -80,6 +89,7 @@ func NewRestateClient(baseURL, clusterID string, timeout time.Duration, log *zap
 	return &RestateClient{
 		url:       baseURL,
 		clusterID: clusterID,
+		auth:      a,
 		http: &http.Client{
 			Timeout: timeout,
 		},
@@ -88,21 +98,40 @@ func NewRestateClient(baseURL, clusterID string, timeout time.Duration, log *zap
 	}
 }
 
+// errUnauthorized : identifiants refusés ; l'authentification est
+// renouvelée avant le prochain essai (jeton expiré ou clé tournée).
+var errUnauthorized = errors.New("unauthorized: check the watcher key")
+
+// checkAuth : sur 401, invalide le jeton pour que l'essai suivant en obtienne un neuf.
+func (c *RestateClient) checkAuth(resp *http.Response) error {
+	if resp.StatusCode == http.StatusUnauthorized {
+		c.auth.Invalidate()
+		return errUnauthorized
+	}
+	return nil
+}
+
 func (c *RestateClient) Enroll(ctx context.Context) error {
-	endpoint := fmt.Sprintf("%s/ClusterService/Enroll", c.url)
+	endpoint := fmt.Sprintf(enrollEndpointFmt, c.url)
 	body, _ := json.Marshal(map[string]string{
 		"cluster_id": c.clusterID,
-		"version":    "v1.0.0",
+		"version":    agentVersion,
 	})
 
 	_, err := c.cb.Execute(func() (interface{}, error) {
 		req, _ := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
-		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set(headerContentType, mimeJSON)
+		if err := c.auth.Apply(ctx, req); err != nil {
+			return nil, err
+		}
 		resp, err := c.http.Do(req)
 		if err != nil {
 			return nil, err
 		}
 		defer resp.Body.Close()
+		if err := c.checkAuth(resp); err != nil {
+			return nil, err
+		}
 		if resp.StatusCode >= 400 {
 			return nil, fmt.Errorf("enroll failed: %d", resp.StatusCode)
 		}
@@ -112,15 +141,21 @@ func (c *RestateClient) Enroll(ctx context.Context) error {
 }
 
 func (c *RestateClient) GetRemoteConfig(ctx context.Context) (*RemoteConfig, error) {
-	endpoint := fmt.Sprintf("%s/ConfigService/%s/Get", c.url, c.clusterID)
+	endpoint := fmt.Sprintf(remoteConfigEndpointFmt, c.url, c.clusterID)
 
 	result, err := c.cb.Execute(func() (interface{}, error) {
 		req, _ := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+		if err := c.auth.Apply(ctx, req); err != nil {
+			return nil, err
+		}
 		resp, err := c.http.Do(req)
 		if err != nil {
 			return nil, err
 		}
 		defer resp.Body.Close()
+		if err := c.checkAuth(resp); err != nil {
+			return nil, err
+		}
 
 		if resp.StatusCode != http.StatusOK {
 			return nil, fmt.Errorf("config fetch failed: %d", resp.StatusCode)
@@ -151,8 +186,8 @@ func (c *RestateClient) NotifyPodEvent(ctx context.Context, event PodEvent) erro
 		return fmt.Errorf("marshal pod event: %w", err)
 	}
 
-	endpoint := fmt.Sprintf("%s/ProjectService/%s/onPodEvent", c.url, c.clusterID)
-	backoff := []time.Duration{500 * time.Millisecond, time.Second, 2 * time.Second}
+	endpoint := fmt.Sprintf(podEventEndpointFmt, c.url, c.clusterID)
+	backoff := podEventBackoff
 
 	for attempt := 0; ; attempt++ {
 		_, cbErr := c.cb.Execute(func() (interface{}, error) {
@@ -160,7 +195,10 @@ func (c *RestateClient) NotifyPodEvent(ctx context.Context, event PodEvent) erro
 			if reqErr != nil {
 				return nil, reqErr
 			}
-			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set(headerContentType, mimeJSON)
+			if authErr := c.auth.Apply(ctx, req); authErr != nil {
+				return nil, authErr
+			}
 
 			resp, doErr := c.http.Do(req)
 			if doErr != nil {
@@ -171,6 +209,15 @@ func (c *RestateClient) NotifyPodEvent(ctx context.Context, event PodEvent) erro
 
 			metrics.RestateRequestsTotal.WithLabelValues(strconv.Itoa(resp.StatusCode)).Inc()
 
+			if err := c.checkAuth(resp); err != nil {
+				return nil, err // réessayé avec un jeton neuf
+			}
+			if resp.StatusCode == http.StatusForbidden {
+				// Clé d'un autre cluster ou rôle retiré : permanent, ne pas insister.
+				c.log.Errorw("pod event refused by backend (403): the key does not belong to this cluster",
+					"cluster_id", c.clusterID)
+				return nil, nil
+			}
 			if resp.StatusCode >= http.StatusInternalServerError {
 				return nil, fmt.Errorf("restate server error: %d", resp.StatusCode)
 			}
@@ -198,59 +245,33 @@ func (c *RestateClient) NotifyPodEvent(ctx context.Context, event PodEvent) erro
 	}
 }
 
-func (c *RestateClient) NotifyPodEvents(ctx context.Context, events []PodEvent) error {
-	if len(events) == 0 {
-		return nil
-	}
-
-	body, err := json.Marshal(events)
+func (c *RestateClient) ReportServiceAccountKeys(ctx context.Context, issuer string, jwks json.RawMessage) error {
+	endpoint := fmt.Sprintf(serviceAccountKeysEndpFmt, c.url, c.clusterID)
+	body, err := json.Marshal(map[string]any{"issuer": issuer, "jwks": jwks})
 	if err != nil {
-		return fmt.Errorf("marshal pod events batch: %w", err)
+		return err
 	}
-
-	endpoint := fmt.Sprintf("%s/ProjectService/%s/onPodEvents", c.url, c.clusterID)
-	backoff := []time.Duration{500 * time.Millisecond, time.Second, 2 * time.Second}
-
-	for attempt := 0; ; attempt++ {
-		_, cbErr := c.cb.Execute(func() (interface{}, error) {
-			req, reqErr := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
-			if reqErr != nil {
-				return nil, reqErr
-			}
-			req.Header.Set("Content-Type", "application/json")
-
-			resp, doErr := c.http.Do(req)
-			if doErr != nil {
-				metrics.RestateRequestsTotal.WithLabelValues("error").Inc()
-				return nil, doErr
-			}
-			defer resp.Body.Close()
-
-			metrics.RestateRequestsTotal.WithLabelValues(strconv.Itoa(resp.StatusCode)).Inc()
-
-			if resp.StatusCode >= http.StatusInternalServerError {
-				return nil, fmt.Errorf("restate server error: %d", resp.StatusCode)
-			}
-			return nil, nil
-		})
-
-		if cbErr == nil {
-			return nil
+	_, err = c.cb.Execute(func() (interface{}, error) {
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
+		if err != nil {
+			return nil, err
 		}
-
-		if errors.Is(cbErr, gobreaker.ErrOpenState) {
-			return fmt.Errorf("circuit breaker open: %w", cbErr)
+		req.Header.Set(headerContentType, mimeJSON)
+		if err := c.auth.Apply(ctx, req); err != nil {
+			return nil, err
 		}
-
-		if attempt >= len(backoff) {
-			return fmt.Errorf("failed after retries: %w", cbErr)
+		resp, err := c.http.Do(req)
+		if err != nil {
+			return nil, err
 		}
-
-		select {
-		case <-time.After(backoff[attempt]):
-			continue
-		case <-ctx.Done():
-			return ctx.Err()
+		defer resp.Body.Close()
+		if err := c.checkAuth(resp); err != nil {
+			return nil, err
 		}
-	}
+		if resp.StatusCode >= 400 {
+			return nil, fmt.Errorf("report service account keys failed: %d", resp.StatusCode)
+		}
+		return nil, nil
+	})
+	return err
 }

@@ -12,8 +12,12 @@ import (
 
 // Config holds validated runtime settings.
 type Config struct {
-	RestateURL         string        `mapstructure:"restate_url"`
-	ClusterID          string        `mapstructure:"cluster_id"`
+	RestateURL string `mapstructure:"restate_url"`
+	ClusterID  string `mapstructure:"cluster_id"`
+	APIKey     string `mapstructure:"api_key"`
+	// KeyFile : fichier de clé du compte de service du cluster (recommandé :
+	// jetons courts du STS, aucun secret envoyé). Exclusif avec APIKey.
+	KeyFile            string        `mapstructure:"key_file"`
 	WatchNamespaceMode string        `mapstructure:"watch_namespace_mode"`
 	WatchNamespace     string        `mapstructure:"watch_namespace"`
 	ManagedNSLabel     string        `mapstructure:"managed_ns_label"`
@@ -21,11 +25,36 @@ type Config struct {
 	RestateCallTimeout time.Duration `mapstructure:"restate_timeout"`
 	RemoteConfigURL    string        `mapstructure:"remote_config_url"`
 	RemoteConfigFetch  time.Duration `mapstructure:"remote_config_fetch"`
-	BatchSize          int           `mapstructure:"batch_size"`
 }
 
+// Modes de sélection des espaces de noms surveillés.
 const (
-	defaultWatchNamespaceMode = "single"
+	// ModeSingle : un seul espace de noms (watch_namespace).
+	ModeSingle = "single"
+	// ModeLabel : tous les espaces portant le label managed_ns_label=true.
+	ModeLabel = "label"
+)
+
+// Sources de configuration (en plus des drapeaux).
+const (
+	configFileName = "config"
+	configFileType = "yaml"
+	configDirLocal = "."
+	configDirSub   = "./config"
+)
+
+// Alias des variables d'environnement des secrets montés.
+const (
+	keyAPIKey     = "api_key"
+	envAPIKey     = "WATCHER_API_KEY"
+	envAPIKeyAlt  = "API_KEY"
+	keyKeyFile    = "key_file"
+	envKeyFile    = "WATCHER_KEY_FILE"
+	envKeyFileAlt = "KEY_FILE"
+)
+
+const (
+	defaultWatchNamespaceMode = ModeSingle
 	defaultHTTPListen         = ":8080"
 	defaultRestateTimeout     = 5 * time.Second
 	defaultRemoteConfigFetch  = 5 * time.Minute
@@ -36,6 +65,8 @@ func Load() (Config, error) {
 	// Define flags using pflag for better viper integration
 	pflag.String("restate-url", "", "Base URL for Restate service")
 	pflag.String("cluster-id", "", "Cluster identifier")
+	pflag.String("key-file", "", "Service account key file (JSON) of this cluster: short-lived STS tokens, recommended. Fallback env: WATCHER_KEY_FILE")
+	pflag.String("api-key", "", "API key for authenticating against the backend (X-API-Key header). Fallback env: WATCHER_API_KEY or API_KEY")
 	pflag.String("watch-namespace-mode", defaultWatchNamespaceMode, "Namespace selection mode: single|label")
 	pflag.String("watch-namespace", "", "Target namespace when mode=single")
 	pflag.String("managed-ns-label", "", "Namespace label selector when mode=label")
@@ -43,11 +74,10 @@ func Load() (Config, error) {
 	pflag.Duration("restate-timeout", defaultRestateTimeout, "Timeout for Restate calls")
 	pflag.String("remote-config-url", "", "URL to fetch remote configuration from")
 	pflag.Duration("remote-config-fetch", defaultRemoteConfigFetch, "Interval to fetch remote configuration")
-	pflag.Int("batch-size", 100, "Batch size for processing")
 	pflag.Parse()
 
 	// Bind flags to viper
-	if err := viper.BindPFlags(pflag.CommandLine); err != nil {
+	if err := bindFlags(viper.GetViper(), pflag.CommandLine); err != nil {
 		return Config{}, fmt.Errorf("bind flags: %w", err)
 	}
 
@@ -55,11 +85,15 @@ func Load() (Config, error) {
 	viper.SetEnvKeyReplacer(strings.NewReplacer("-", "_", ".", "_"))
 	viper.AutomaticEnv()
 
+	// Alias explicites pour WATCHER_API_KEY (convention K8s secret mount) et API_KEY.
+	_ = viper.BindEnv(keyAPIKey, envAPIKey, envAPIKeyAlt)
+	_ = viper.BindEnv(keyKeyFile, envKeyFile, envKeyFileAlt)
+
 	// Config file
-	viper.SetConfigName("config")
-	viper.SetConfigType("yaml")
-	viper.AddConfigPath(".")
-	viper.AddConfigPath("./config")
+	viper.SetConfigName(configFileName)
+	viper.SetConfigType(configFileType)
+	viper.AddConfigPath(configDirLocal)
+	viper.AddConfigPath(configDirSub)
 
 	if err := viper.ReadInConfig(); err != nil {
 		var configFileNotFoundError viper.ConfigFileNotFoundError
@@ -80,6 +114,20 @@ func Load() (Config, error) {
 	return cfg, nil
 }
 
+// bindFlags : chaque drapeau sous la clé de configuration correspondante
+// (--restate-url → restate_url). BindPFlags les liait sous leur nom à tirets,
+// que la structure (mapstructure restate_url…) ne lit pas : tous les drapeaux
+// étaient ignorés, seules les variables d'environnement fonctionnaient.
+func bindFlags(v *viper.Viper, fs *pflag.FlagSet) error {
+	var err error
+	fs.VisitAll(func(f *pflag.Flag) {
+		if err == nil {
+			err = v.BindPFlag(strings.ReplaceAll(f.Name, "-", "_"), f)
+		}
+	})
+	return err
+}
+
 func validate(cfg Config) error {
 	if cfg.RestateURL == "" {
 		return errors.New("restate_url is required")
@@ -87,12 +135,15 @@ func validate(cfg Config) error {
 	if cfg.ClusterID == "" {
 		return errors.New("cluster_id is required")
 	}
+	if cfg.KeyFile != "" && cfg.APIKey != "" {
+		return errors.New("set either key_file or api_key, not both")
+	}
 	switch cfg.WatchNamespaceMode {
-	case "single":
+	case ModeSingle:
 		if cfg.WatchNamespace == "" {
 			return errors.New("watch_namespace is required when watch_namespace_mode=single")
 		}
-	case "label":
+	case ModeLabel:
 		if cfg.ManagedNSLabel == "" {
 			return errors.New("managed_ns_label is required when watch_namespace_mode=label")
 		}

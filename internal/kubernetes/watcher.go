@@ -7,9 +7,9 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
-	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/cache"
 
 	"go.uber.org/zap"
@@ -34,9 +34,9 @@ type Manager struct {
 }
 
 func NewManager(cfg config.Config, rc restate.IRestateClient, log *zap.SugaredLogger) (*Manager, error) {
-	restCfg, err := rest.InClusterConfig()
+	restCfg, err := RESTConfig()
 	if err != nil {
-		return nil, fmt.Errorf("build in-cluster config: %w", err)
+		return nil, fmt.Errorf("build kubernetes config: %w", err)
 	}
 
 	clientset, err := kubernetes.NewForConfig(restCfg)
@@ -44,7 +44,7 @@ func NewManager(cfg config.Config, rc restate.IRestateClient, log *zap.SugaredLo
 		return nil, fmt.Errorf("create kubernetes client: %w", err)
 	}
 
-	processor := NewEventProcessor(rc, log, 3*time.Minute, cfg.BatchSize)
+	processor := NewEventProcessor(rc, log, defaultDedupCooldown)
 
 	return &Manager{
 		cfg:           cfg,
@@ -66,98 +66,25 @@ func (m *Manager) Run(ctx context.Context) error {
 	go m.processor.Run(ctx)
 	go m.processor.CleanupLoop(ctx)
 	go m.configSyncLoop(ctx)
+	go m.serviceAccountKeysLoop(ctx)
 
-	if m.cfg.WatchNamespaceMode == "single" {
+	if m.cfg.WatchNamespaceMode == config.ModeSingle {
 		m.startNamespaceInformer(ctx, m.cfg.WatchNamespace)
 		<-ctx.Done()
 		return nil
 	}
 
-	// Label mode: Dynamic discovery of namespaces via Informer
-	m.startNamespaceDiscoveryInformer(ctx)
-	<-ctx.Done()
-	return nil
-}
+	// Label mode: Dynamic discovery of namespaces
+	ticker := time.NewTicker(namespaceDiscoveryPeriod)
+	defer ticker.Stop()
 
-func (m *Manager) startNamespaceDiscoveryInformer(ctx context.Context) {
-	factory := informers.NewSharedInformerFactory(m.clientset, 10*time.Minute)
-	nsInformer := factory.Core().V1().Namespaces().Informer()
-
-	labelKey := m.cfg.ManagedNSLabel
-
-	nsInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
-		AddFunc: func(obj interface{}) {
-			ns, ok := obj.(*corev1.Namespace)
-			if !ok {
-				return
-			}
-			if ns.Labels[labelKey] == "true" {
-				m.ensureNamespaceWatcher(ctx, ns.Name)
-			}
-		},
-		UpdateFunc: func(oldObj, newObj interface{}) {
-			newNS, ok := newObj.(*corev1.Namespace)
-			if !ok {
-				return
-			}
-			oldNS, ok := oldObj.(*corev1.Namespace)
-			if !ok {
-				return
-			}
-
-			// Check if label was added or removed
-			isManagedNow := newNS.Labels[labelKey] == "true"
-			wasManaged := oldNS.Labels[labelKey] == "true"
-
-			if isManagedNow && !wasManaged {
-				m.ensureNamespaceWatcher(ctx, newNS.Name)
-			} else if !isManagedNow && wasManaged {
-				m.stopNamespaceWatcher(newNS.Name)
-			}
-		},
-		DeleteFunc: func(obj interface{}) {
-			ns, ok := obj.(*corev1.Namespace)
-			if !ok {
-				// Handle DeletedFinalStateUnknown
-				if tombstone, ok := obj.(cache.DeletedFinalStateUnknown); ok {
-					if ns, ok = tombstone.Obj.(*corev1.Namespace); ok {
-						m.stopNamespaceWatcher(ns.Name)
-					}
-				}
-				return
-			}
-			m.stopNamespaceWatcher(ns.Name)
-		},
-	})
-
-	go factory.Start(ctx.Done())
-	if !cache.WaitForCacheSync(ctx.Done(), nsInformer.HasSynced) {
-		m.log.Error("failed to sync namespace discovery cache")
-		return
-	}
-	m.log.Infow("namespace discovery informer started", "label", labelKey)
-}
-
-func (m *Manager) ensureNamespaceWatcher(ctx context.Context, namespace string) {
-	m.informerMu.Lock()
-	defer m.informerMu.Unlock()
-
-	if _, ok := m.informers[namespace]; !ok {
-		m.log.Infow("starting watcher for new namespace", "namespace", namespace)
-		nsCtx, cancel := context.WithCancel(ctx)
-		m.informers[namespace] = cancel
-		go m.startNamespaceInformer(nsCtx, namespace)
-	}
-}
-
-func (m *Manager) stopNamespaceWatcher(namespace string) {
-	m.informerMu.Lock()
-	defer m.informerMu.Unlock()
-
-	if cancel, ok := m.informers[namespace]; ok {
-		m.log.Infow("stopping watcher for namespace", "namespace", namespace)
-		cancel()
-		delete(m.informers, namespace)
+	for {
+		m.discoverNamespaces(ctx)
+		select {
+		case <-ticker.C:
+		case <-ctx.Done():
+			return nil
+		}
 	}
 }
 
@@ -185,19 +112,53 @@ func (m *Manager) configSyncLoop(ctx context.Context) {
 	}
 }
 
+func (m *Manager) discoverNamespaces(ctx context.Context) {
+	selector := fmt.Sprintf(managedLabelSelectorFmt, m.cfg.ManagedNSLabel)
+	nsList, err := m.clientset.CoreV1().Namespaces().List(ctx, metav1.ListOptions{
+		LabelSelector: selector,
+	})
+	if err != nil {
+		m.log.Errorw("failed to list namespaces", "selector", selector, "err", err)
+		return
+	}
+
+	m.informerMu.Lock()
+	defer m.informerMu.Unlock()
+
+	activeNS := make(map[string]bool)
+	for _, ns := range nsList.Items {
+		activeNS[ns.Name] = true
+		if _, ok := m.informers[ns.Name]; !ok {
+			m.log.Infow("starting watcher for new namespace", "namespace", ns.Name)
+			nsCtx, cancel := context.WithCancel(ctx)
+			m.informers[ns.Name] = cancel
+			go m.startNamespaceInformer(nsCtx, ns.Name)
+		}
+	}
+
+	// Stop informers for namespaces no longer managed
+	for ns, cancel := range m.informers {
+		if !activeNS[ns] {
+			m.log.Infow("stopping watcher for namespace", "namespace", ns)
+			cancel()
+			delete(m.informers, ns)
+		}
+	}
+}
+
 func (m *Manager) startNamespaceInformer(ctx context.Context, namespace string) {
-	factory := informers.NewSharedInformerFactoryWithOptions(m.clientset, 10*time.Minute, informers.WithNamespace(namespace))
+	factory := informers.NewSharedInformerFactoryWithOptions(m.clientset, informerResync, informers.WithNamespace(namespace))
 	podInformer := factory.Core().V1().Pods().Informer()
 
 	podInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc: func(obj interface{}) {
-			m.handlePodEvent("Added", obj)
+			m.handlePodEvent(eventAdded, obj)
 		},
 		UpdateFunc: func(oldObj, newObj interface{}) {
-			m.handlePodEvent("Modified", newObj)
+			m.handlePodEvent(eventModified, newObj)
 		},
 		DeleteFunc: func(obj interface{}) {
-			m.handlePodEvent("Deleted", obj)
+			m.handlePodEvent(eventDeleted, obj)
 		},
 	})
 
@@ -224,27 +185,7 @@ func (m *Manager) handlePodEvent(eventType string, obj interface{}) {
 }
 
 func (m *Manager) toPodEvent(eventType string, pod *corev1.Pod) restate.PodEvent {
-	reason := ""
-	message := ""
-	containerName := ""
-
-	for _, cs := range pod.Status.ContainerStatuses {
-		if cs.State.Waiting != nil {
-			reason = cs.State.Waiting.Reason
-			message = cs.State.Waiting.Message
-			containerName = cs.Name
-			break
-		}
-		if cs.State.Terminated != nil {
-			reason = cs.State.Terminated.Reason
-			message = cs.State.Terminated.Message
-			containerName = cs.Name
-			if reason == "Completed" {
-				continue
-			}
-			break
-		}
-	}
+	reason, message, containerName := podIncident(pod, time.Now())
 
 	restartCount := int32(0)
 	for _, cs := range pod.Status.ContainerStatuses {
@@ -252,8 +193,7 @@ func (m *Manager) toPodEvent(eventType string, pod *corev1.Pod) restate.PodEvent
 	}
 
 	return restate.PodEvent{
-		// Use UID, ResourceVersion and Reason to create a deterministic EventID for idempotency
-		EventID:       fmt.Sprintf("%s-%s-%s", pod.UID, pod.ResourceVersion, reason),
+		EventID:       fmt.Sprintf("%s-%d", pod.UID, time.Now().UnixNano()),
 		Namespace:     pod.Namespace,
 		Name:          pod.Name,
 		Phase:         string(pod.Status.Phase),
@@ -263,4 +203,48 @@ func (m *Manager) toPodEvent(eventType string, pod *corev1.Pod) restate.PodEvent
 		ContainerName: containerName,
 		Labels:        pod.Labels,
 	}
+}
+
+// podIncident : raison la plus utile d'un pod, dans cet ordre :
+//  1. expulsion (raison portée par le pod, pas par ses conteneurs) ;
+//  2. conteneur en attente (CrashLoopBackOff, ImagePullBackOff…) ; en
+//     CrashLoopBackOff, OOMKilled l'emporte si c'est la cause du dernier arrêt ;
+//  3. conteneur arrêté en erreur ;
+//  4. conteneur redémarré depuis peu après un OOMKilled (l'état courant est
+//     Running et ne dit plus rien).
+//
+// Le cas 4 n'est retenu que dans la fenêtre lastTerminationFresh : au-delà,
+// une resynchronisation de l'informer renverrait un incident clos et
+// remettrait le conteneur en OOM_KILLED après son retour à RUNNING.
+func podIncident(pod *corev1.Pod, now time.Time) (reason, message, container string) {
+	if pod.Status.Reason == reasonEvicted {
+		return reasonEvicted, pod.Status.Message, ""
+	}
+	statuses := make([]corev1.ContainerStatus, 0, len(pod.Status.InitContainerStatuses)+len(pod.Status.ContainerStatuses))
+	statuses = append(statuses, pod.Status.InitContainerStatuses...)
+	statuses = append(statuses, pod.Status.ContainerStatuses...)
+
+	for _, cs := range statuses {
+		if w := cs.State.Waiting; w != nil && w.Reason != "" {
+			if w.Reason == reasonCrashLoopBackOff {
+				if last := cs.LastTerminationState.Terminated; last != nil && last.Reason == reasonOOMKilled {
+					return reasonOOMKilled, w.Message, cs.Name
+				}
+			}
+			return w.Reason, w.Message, cs.Name
+		}
+	}
+	for _, cs := range statuses {
+		if t := cs.State.Terminated; t != nil && t.Reason != reasonCompleted {
+			return t.Reason, t.Message, cs.Name
+		}
+	}
+	for _, cs := range statuses {
+		last := cs.LastTerminationState.Terminated
+		if cs.State.Running != nil && last != nil && last.Reason == reasonOOMKilled &&
+			now.Sub(last.FinishedAt.Time) <= lastTerminationFresh {
+			return reasonOOMKilled, last.Message, cs.Name
+		}
+	}
+	return "", "", ""
 }

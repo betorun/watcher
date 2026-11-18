@@ -42,21 +42,21 @@ type Processor interface {
 	GetMetadata(podName string) (projectID, workloadID string, ok bool)
 }
 
-func NewEventProcessor(rc restate.IRestateClient, log *zap.SugaredLogger, cooldown time.Duration, batchSize int) *EventProcessor {
+func NewEventProcessor(rc restate.IRestateClient, log *zap.SugaredLogger, cooldown time.Duration) *EventProcessor {
 	return &EventProcessor{
 		restateClient: rc,
 		log:           log,
 		cooldown:      cooldown,
-		batchSize:     batchSize,
-		batchFlush:    time.Second,
-		eventChan:     make(chan restate.PodEvent, 1000),
+		batchSize:     defaultBatchSize,
+		batchFlush:    defaultBatchFlush,
+		eventChan:     make(chan restate.PodEvent, eventQueueSize),
 		enabledReasons: map[string]bool{
-			"CrashLoopBackOff":           true,
-			"ImagePullBackOff":           true,
-			"CreateContainerConfigError": true,
-			"OOMKilled":                  true,
-			"Failed":                     true,
-			"Evicted":                    true,
+			reasonCrashLoopBackOff:           true,
+			reasonImagePullBackOff:           true,
+			reasonCreateContainerConfigError: true,
+			reasonOOMKilled:                  true,
+			reasonFailed:                     true,
+			reasonEvicted:                    true,
 		},
 	}
 }
@@ -89,8 +89,8 @@ func (p *EventProcessor) ApplyRemoteConfig(cfg *restate.RemoteConfig) {
 
 func (p *EventProcessor) Process(ctx context.Context, event restate.PodEvent) {
 	// Extract metadata from labels if available
-	projectID := event.Labels["project-id"]
-	workloadID := event.Labels["workload-id"]
+	projectID := firstLabel(event.Labels, labelProjectID, legacyLabelProjectID)
+	workloadID := firstLabel(event.Labels, labelWorkloadID, legacyLabelWorkloadID)
 	if projectID != "" || workloadID != "" {
 		p.metadataMap.Store(event.Name, PodMetadata{
 			ProjectID:  projectID,
@@ -147,20 +147,23 @@ func (p *EventProcessor) Run(ctx context.Context) {
 			return
 		}
 
-		// Send batch to Restate
-		status := "success"
-		err := p.restateClient.NotifyPodEvents(ctx, batch)
-		if err != nil {
-			p.log.Errorw("failed to notify restate batch", "err", err, "batch_size", len(batch))
-			status = "error"
-		}
-
-		// Log and update metrics for each event in the batch
+		// parallel notifications to avoid blocking the main loop
+		var wg sync.WaitGroup
 		for _, ev := range batch {
-			p.auditLog(ev, status)
-			metrics.QueueDepth.Dec()
+			wg.Add(1)
+			go func(e restate.PodEvent) {
+				defer wg.Done()
+				status := "success"
+				err := p.restateClient.NotifyPodEvent(ctx, e)
+				if err != nil {
+					p.log.Errorw("failed to notify restate", "err", err, "pod", e.Name)
+					status = "error"
+				}
+				p.auditLog(e, status)
+				metrics.QueueDepth.Dec()
+			}(ev)
 		}
-
+		wg.Wait()
 		batch = batch[:0]
 	}
 
@@ -212,7 +215,7 @@ func (p *EventProcessor) shouldProcess(event restate.PodEvent) bool {
 	if p.enabledReasons[event.Reason] {
 		return true
 	}
-	if event.Phase == "Pending" && event.Reason != "" {
+	if event.Phase == phasePending && event.Reason != "" {
 		return true
 	}
 	if event.RestartCount > 0 {
@@ -222,7 +225,7 @@ func (p *EventProcessor) shouldProcess(event restate.PodEvent) bool {
 }
 
 func (p *EventProcessor) CleanupLoop(ctx context.Context) {
-	ticker := time.NewTicker(10 * time.Minute)
+	ticker := time.NewTicker(cleanupInterval)
 	defer ticker.Stop()
 
 	for {
@@ -239,15 +242,24 @@ func (p *EventProcessor) CleanupLoop(ctx context.Context) {
 				}
 				return true
 			})
-
-			// Clean up metadata map for pods not seen in 6 hours
+			// Métadonnées des pods qui n'émettent plus rien : sans ce ménage, la
+			// table grossit avec chaque pod passé par le cluster.
 			p.metadataMap.Range(func(key, value interface{}) bool {
-				meta := value.(PodMetadata)
-				if time.Since(meta.LastSeen) > 6*time.Hour {
+				if time.Since(value.(PodMetadata).LastSeen) > metadataTTL {
 					p.metadataMap.Delete(key)
 				}
 				return true
 			})
 		}
 	}
+}
+
+// firstLabel : valeur du premier label présent.
+func firstLabel(labels map[string]string, keys ...string) string {
+	for _, k := range keys {
+		if v := labels[k]; v != "" {
+			return v
+		}
+	}
+	return ""
 }
